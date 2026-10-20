@@ -36,6 +36,7 @@
 #include "path/path.h"
 #include "path/binding.h"
 #include "path/canon.h"
+#include "path/pcache.h"
 #include "path/proc.h"
 #include "extension/extension.h"
 #include "cli/note.h"
@@ -369,6 +370,25 @@ int translate_path(Tracee *tracee, char result[PATH_MAX], int dir_fd,
 		return status;
 	strcpy(result, "/");
 
+	/*
+	 * Fast path: reuse the translation already computed for this exact
+	 * (guest_path, deref_final) pair.  The cached value is a host path
+	 * with bindings already substituted, so it can be used as-is.
+	 *
+	 * With a fake root attached, canonicalize() has a side effect: it lets
+	 * fake_id0 widen the mode of every component so the fake root can
+	 * reach it.  That is only meaningful outside the guest rootfs (inside
+	 * it, override_permissions() is a no-op because we own the files), so
+	 * a cached translation may be served only when it lands inside the
+	 * rootfs; anything else falls through and is canonicalized again.
+	 */
+	if (path_cache_get(tracee, guest_path, deref_final, result)) {
+		if (!extensions_need_host_path(tracee)
+		    || belongs_to_guestfs(tracee, result))
+			goto skip;
+		strcpy(result, "/");
+	}
+
 	/* Canonicalize regarding the new root. */
 	status = canonicalize(tracee, guest_path, deref_final, result, 0);
 	if (status < 0)
@@ -380,6 +400,8 @@ int translate_path(Tracee *tracee, char result[PATH_MAX], int dir_fd,
 	status = substitute_binding(tracee, GUEST, result);
 	if (status < 0)
 		return status;
+
+	path_cache_put(tracee, guest_path, deref_final, result);
 
 skip:
 	VERBOSE(tracee, 2, "vpid %" PRIu64 ":          -> \"%s\"",

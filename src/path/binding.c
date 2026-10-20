@@ -33,6 +33,7 @@
 #include "path/binding.h"
 #include "path/path.h"
 #include "path/canon.h"
+#include "path/pcache.h"
 #include "cli/note.h"
 
 #include "compat.h"
@@ -385,11 +386,14 @@ static void insort_binding2(const Tracee *tracee, Binding *binding)
 
 	insort_binding(tracee, GUEST, binding);
 	insort_binding(tracee, HOST, binding);
+
+	/* Any new binding changes how guest paths resolve. */
+	path_cache_reset();
 }
 
 /**
  * Create and insert a new binding (@host_path:@guest_path) into the
- * list of @tracee's bindings.  The Talloc parent of this new binding
+ * list of @tracee's bindings.  The TALLOC parent of this new binding
  * is @context.  This function returns NULL if an error occurred,
  * otherwise a pointer to the newly created binding.
  */

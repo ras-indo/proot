@@ -75,6 +75,7 @@
 #include "tracee/abi.h"
 #include "tracee/event.h"
 #include "path/path.h"
+#include "path/pcache.h"
 #include "path/canon.h"
 #include "path/binding.h"
 #include "path/temp.h"
@@ -1909,6 +1910,12 @@ int translate_syscall_enter(Tracee *tracee)
 
 	/* Translate input arguments. */
 	syscall_number = get_sysnum(tracee, ORIGINAL);
+
+	/* A syscall able to change how guest paths resolve must not see --
+	 * nor leave behind -- stale path translations.  */
+	if (path_cache_sysnum_invalidates((Sysnum) syscall_number))
+		path_cache_reset();
+
 	switch (syscall_number) {
 	default:
 		/* Nothing to do. */

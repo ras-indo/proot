@@ -195,6 +195,13 @@ typedef struct extension {
 	/* Link to the next and previous extensions.  Note the order
 	 * is *never* garantee.  */
 	LIST_ENTRY(extension) link;
+
+	/* Set by extensions with side effects on HOST_PATH events (fake_id0
+	 * with a fake root temporarily widens permissions for every
+	 * canonicalized component).  PRoot must then keep running
+	 * canonicalize() for every translated path, so the path translation
+	 * cache stays disabled for such a tracee.  */
+	bool needs_host_path;
 } Extension;
 
 typedef LIST_HEAD(extensions, extension) Extensions;
@@ -207,6 +214,25 @@ extern Extension *get_extension(Tracee *tracee, extension_callback_t callback);
  * Notify all extensions of @tracee that the given @event occured.
  * See ExtensionEvent for the meaning of @data1 and @data2.
  */
+/**
+ * Return true when any extension attached to @tracee has side effects on
+ * HOST_PATH events, in which case canonicalize() must not be skipped.
+ */
+static inline bool extensions_need_host_path(Tracee *tracee)
+{
+	Extension *extension;
+
+	if (tracee->extensions == NULL)
+		return false;
+
+	LIST_FOREACH(extension, tracee->extensions, link) {
+		if (extension->needs_host_path)
+			return true;
+	}
+
+	return false;
+}
+
 static inline int notify_extensions(Tracee *tracee, ExtensionEvent event,
 				intptr_t data1, intptr_t data2)
 {

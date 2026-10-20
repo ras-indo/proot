@@ -436,6 +436,23 @@ static void override_permissions(const Tracee *tracee, const char *path, bool is
 	mode_t new_mode;
 	int status;
 
+	/* Paths that live inside the guest rootfs are owned by the real uid
+	 * of this process (the tarball was extracted as an unprivileged app,
+	 * so the ownership on disk is ours, not root's).  Widening their mode
+	 * buys nothing: the owner already has the access the fake root is
+	 * supposed to grant.  Skipping it removes a stat() plus a
+	 * chmod()/restore pair for every single component of every path a
+	 * guest touches - the single largest cost of running with -0 -
+	 * while leaving the override in place for bound host paths
+	 * (/system, /vendor, /dev, /proc, ...) where it is actually needed.
+	 *
+	 * PROOT_FAKE_ROOT_FULL_OVERRIDE=1 restores the unconditional
+	 * behaviour, for a filesystem where the rootfs is not owned by the
+	 * process (e.g. rootfs on a shared ext4 mounted by root). */
+	if (belongs_to_guestfs(tracee, path)
+	    && !getenv("PROOT_FAKE_ROOT_FULL_OVERRIDE"))
+		return;
+
 	/* Get the meta-data */
 	if (should_skip_file_access_due_to_f2fs_bug(tracee, path)) 
 		return;
@@ -1369,6 +1386,11 @@ int fake_id0_callback(Extension *extension, ExtensionEvent event, intptr_t data1
 #endif
 
 		extension->filtered_sysnums = filtered_sysnums;
+
+		/* A fake root makes override_permissions() run for every
+		 * canonicalized component, so canonicalize() must not be
+		 * skipped: disable the path translation cache.  */
+		extension->needs_host_path = (config->euid == 0);
 		return 0;
 	}
 

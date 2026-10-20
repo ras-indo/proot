@@ -15,8 +15,8 @@ OBJCOPY  ?= $(CROSS_COMPILE)objcopy
 OBJDUMP  ?= $(CROSS_COMPILE)objdump
 
 CPPFLAGS += -D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE -I. -I$(VPATH)
-CFLAGS   += -Wall -Wextra -O2
-LDFLAGS  += -ltalloc -Wl,-z,noexecstack
+CFLAGS   += -O3 -flto -fomit-frame-pointer -ffunction-sections -fdata-sections -DNDEBUG -Wall -Wextra
+LDFLAGS  += -ltalloc -Wl,-z,noexecstack -flto -Wl,--gc-sections
 ifdef PROOT_WITH_LIBANDROID_SHMEM
   CFLAGS += -DWITH_LIBANDROID_SHMEM
   LDFLAGS += -landroid-shmem
@@ -40,6 +40,7 @@ OBJECTS += \
 	path/path.o		\
 	path/proc.o		\
 	path/temp.o		\
+	path/pcache.o		\
 	syscall/seccomp.o	\
 	syscall/syscall.o	\
 	syscall/chain.o		\
