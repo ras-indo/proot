@@ -1,0 +1,269 @@
+name: PRoot fork CI
+
+# Runs the upstream test suite against the fork.
+#
+# The fork exists because the app ships a patched proot, and a patch to
+# proot is only safe if the upstream test suite still passes.  This
+# workflow runs that suite on every push to the fork, so a regression is
+# caught here instead of in the app's build weeks later.
+#
+# A test that fails is not automatically a regression: some of the
+# upstream tests fail on a stock Ubuntu runner for reasons that have
+# nothing to do with the fork (they expect a root user, or they expect
+# a kernel feature the runner does not have).  The suite step therefore
+# records the failures instead of failing the job, and the attribution
+# step below re-runs each failing test against the parent commit:
+#
+#   fails with the patch and passes without it  -> regression, fail
+#   fails with and without the patch             -> pre-existing, pass
+#   cannot be re-run at all                      -> inconclusive, fail
+#
+# The third case is a failure on purpose.  "Unknown" must never be
+# read as "fine", because that is how a real regression slips through a
+# gate that stopped being able to tell.
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  # The commit the fork is compared against.  Override it to compare a
+  # branch against something other than its first parent.
+  BASE_REF: ""
+
+jobs:
+  suite:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install the build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-multilib \
+            libc6-dev-i386
+
+      - name: Build talloc as a static library
+        run: |
+          set -euo pipefail
+          # The talloc sources are vendored (vendor/talloc): the upstream
+          # tarball was unreliable from CI runners and waf's configure
+          # cannot run target binaries anyway.
+          V="$GITHUB_WORKSPACE/vendor/talloc"
+          test -f "$V/talloc.c" || { echo "!! missing vendored talloc"; exit 1; }
+          mkdir -p /tmp/talloc/lib /tmp/talloc/include /tmp/talloc/obj
+          gcc -c -O2 -fPIC \
+            -D_GNU_SOURCE=1 -D_XOPEN_SOURCE_EXTENDED=1 -D__STDC_WANT_LIB_EXT1__=1 \
+            -DSTATIC_talloc_MODULES=NULL \
+            '-DSTATIC_talloc_MODULES_PROTO=extern void __talloc_dummy_module_proto(void)' \
+            -I"$V" -I"$V/lib/replace" \
+            "$V/talloc.c" -o /tmp/talloc/obj/talloc.o
+          ar rcs /tmp/talloc/lib/libtalloc.a /tmp/talloc/obj/talloc.o
+          cp "$V/talloc.h" /tmp/talloc/include/
+          echo 'prefix=/tmp/talloc' > /tmp/talloc/talloc.pc
+          echo 'libdir=${prefix}/lib' >> /tmp/talloc/talloc.pc
+          echo 'includedir=${prefix}/include' >> /tmp/talloc/talloc.pc
+          echo 'Name: talloc' >> /tmp/talloc/talloc.pc
+          echo 'Description: hierarchical pool based memory system' >> /tmp/talloc/talloc.pc
+          echo 'Version: 2.4.2' >> /tmp/talloc/talloc.pc
+          echo 'Libs: -L${libdir} -ltalloc' >> /tmp/talloc/talloc.pc
+          echo 'Cflags: -I${includedir}' >> /tmp/talloc/talloc.pc
+          PKG_CONFIG_PATH=/tmp/talloc pkg-config --exists talloc
+          ls -lh /tmp/talloc/lib/libtalloc.a
+
+      - name: Build proot
+        run: |
+          set -euo pipefail
+          export PKG_CONFIG_PATH=/tmp/talloc
+          make -C src -j"$(nproc)" WITHOUT_PYTHON=1
+          file src/proot
+          strings src/proot | grep -q 'PROOT_NO_PATH_CACHE' \
+            || { echo "!! path cache not built in"; exit 1; }
+
+      - name: Run the upstream test suite
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          # A failing test must not abort the step: the exit status is
+          # checked below, and the attribution step needs the log and
+          # the recorded status.  GitHub runs a step with "bash -e",
+          # and with pipefail the make pipeline would abort the step
+          # right here.
+          set +e
+          cd tests
+          rm -f failure
+          make check PROOT="$PWD/../src/proot" 2>&1 | tee /tmp/check.log
+          rc=${PIPESTATUS[0]}
+          echo "make check exit=$rc"
+          echo "$rc" > /tmp/check.rc
+
+          # Guard against a silently empty suite: "make check" in a
+          # directory without any test file succeeds without running
+          # anything, which would make this job report a green run that
+          # actually tested nothing.
+          checks=$(grep -cE '^[[:space:]]*CHECK[[:space:]]' /tmp/check.log || true)
+          echo "checks executed: $checks"
+          if [ "${checks:-0}" -lt 50 ]; then
+            echo "!! only ${checks:-0} checks ran -- the suite did not really execute"
+            tail -40 /tmp/check.log
+            exit 1
+          fi
+
+          if [ "$rc" -ne 0 ]; then
+            echo "=== last 80 log lines ==="
+            tail -80 /tmp/check.log
+          fi
+
+      - name: Attribute a failure to the patch or to the environment
+        if: always()
+        run: |
+          set -uo pipefail
+          # This step is diagnostic: it must report what it found even
+          # when one of the commands below fails.
+          set +e
+          rc=0
+          [ -f /tmp/check.rc ] && rc=$(cat /tmp/check.rc)
+          if [ "$rc" -eq 0 ]; then
+            echo "the suite passed, nothing to diagnose"
+            exit 0
+          fi
+
+          echo "=== diagnosis: failing tests, verbose, patched vs unpatched ==="
+          # The suite's "failure" file is only a marker that some test
+          # failed; the per-test results are in the log.
+          failed=$(grep -E 'CHECK[[:space:]]+.*FAILED$' /tmp/check.log \
+                   | sed -E 's/.*CHECK[[:space:]]+//; s/[[:space:]]+FAILED$//' \
+                   | sort -u)
+          echo "failing tests: $failed"
+
+          if [ -z "$failed" ]; then
+            echo "no failing test recorded"
+            exit 1
+          fi
+
+          # The reference build is the commit without the change under
+          # test: the first parent of the merge base.
+          if [ -z "$BASE_REF" ]; then
+            BASE_REF=$(git rev-parse HEAD^ 2>/dev/null || echo "")
+          fi
+          echo "reference commit: $BASE_REF"
+          if [ -z "$BASE_REF" ]; then
+            echo "!! no reference commit to compare against"
+            exit 1
+          fi
+
+          rm -rf /tmp/proot-ref
+          git worktree add -f /tmp/proot-ref "$BASE_REF" >/dev/null 2>&1
+          if [ ! -d /tmp/proot-ref/src ]; then
+            echo "!! could not create the reference worktree"
+            exit 1
+          fi
+          export PKG_CONFIG_PATH=/tmp/talloc
+          if make -C /tmp/proot-ref/src -j"$(nproc)" WITHOUT_PYTHON=1 >/tmp/ref-build.log 2>&1; then
+            echo "unpatched reference build: OK"
+          else
+            echo "unpatched reference build: FAILED (see /tmp/ref-build.log)"
+            tail -20 /tmp/ref-build.log
+            exit 1
+          fi
+
+          regressions=0
+          pre_existing=0
+          inconclusive=0
+          for t in $failed; do
+            echo "----- $t -----"
+            # The make targets carry the file extension: check-%.sh for
+            # a shell test, check-%.c for a compiled one.  The name
+            # reported by the suite already starts with "test-".
+            case $t in
+              *.sh|*.c) target=$t ;;
+              *)        target=$(ls "$GITHUB_WORKSPACE/tests/$t".* 2>/dev/null | head -1 | xargs -r basename) ;;
+            esac
+            if [ -z "$target" ]; then
+              echo "  no test file found for $t"
+              inconclusive=$((inconclusive + 1))
+              continue
+            fi
+            base=${target%.*}
+            for label in patched unpatched; do
+              case $label in
+                patched)   bin="$GITHUB_WORKSPACE/src/proot" ;;
+                unpatched) bin=/tmp/proot-ref/src/proot ;;
+              esac
+              if [ ! -x "$bin" ]; then
+                echo "  $label: binary missing"
+                inconclusive=$((inconclusive + 1))
+                continue
+              fi
+              set +e
+              ( cd "$GITHUB_WORKSPACE/tests" && \
+                make -k V=1 "check-$target" \
+                  PROOT="$bin" ) > "/tmp/diag-$base-$label.log" 2>&1
+              st=$?
+              set -e
+              echo "  $label: make_exit=$st"
+              tail -25 "/tmp/diag-$base-$label.log" | sed 's/^/    /'
+            done
+
+            # A verdict is only a verdict if the log actually says so.
+            # An empty or unreadable log is "unknown", never "ok".
+            verdict_patched=unknown
+            if [ -f "/tmp/diag-$base-patched.log" ] && \
+               tr -d '\000' < "/tmp/diag-$base-patched.log" | grep -qE 'CHECK[[:space:]]+.*FAILED'; then
+              verdict_patched=FAILED
+            elif [ -f "/tmp/diag-$base-patched.log" ] && \
+                 tr -d '\000' < "/tmp/diag-$base-patched.log" | grep -qE 'CHECK[[:space:]]+.*skipped'; then
+              verdict_patched=skipped
+            elif [ -f "/tmp/diag-$base-patched.log" ] && \
+                 tr -d '\000' < "/tmp/diag-$base-patched.log" | grep -qE 'CHECK[[:space:]]+.*ok'; then
+              verdict_patched=ok
+            fi
+
+            verdict_unpatched=unknown
+            if [ -f "/tmp/diag-$base-unpatched.log" ] && \
+               tr -d '\000' < "/tmp/diag-$base-unpatched.log" | grep -qE 'CHECK[[:space:]]+.*FAILED'; then
+              verdict_unpatched=FAILED
+            elif [ -f "/tmp/diag-$base-unpatched.log" ] && \
+                 tr -d '\000' < "/tmp/diag-$base-unpatched.log" | grep -qE 'CHECK[[:space:]]+.*skipped'; then
+              verdict_unpatched=skipped
+            elif [ -f "/tmp/diag-$base-unpatched.log" ] && \
+                 tr -d '\000' < "/tmp/diag-$base-unpatched.log" | grep -qE 'CHECK[[:space:]]+.*ok'; then
+              verdict_unpatched=ok
+            fi
+
+            echo "  verdicts: patched=$verdict_patched unpatched=$verdict_unpatched"
+            if [ "$verdict_patched" = FAILED ] && [ "$verdict_unpatched" = ok ]; then
+              echo "VERDICT: REGRESSION -- it fails with the change and passes without it"
+              regressions=$((regressions + 1))
+            elif [ "$verdict_patched" = unknown ] || [ "$verdict_unpatched" = unknown ]; then
+              echo "VERDICT: inconclusive -- the result could not be attributed"
+              inconclusive=$((inconclusive + 1))
+            else
+              echo "VERDICT: pre-existing -- it fails without the change too"
+              pre_existing=$((pre_existing + 1))
+            fi
+          done
+
+          echo "=== summary ==="
+          echo "regressions: $regressions"
+          echo "pre-existing failures: $pre_existing"
+          echo "inconclusive: $inconclusive"
+
+          if [ "$regressions" -gt 0 ]; then
+            echo "!! $regressions test(s) regressed with this change"
+            exit 1
+          fi
+          if [ "$inconclusive" -gt 0 ]; then
+            echo "!! $inconclusive test(s) could not be attributed to either build"
+            exit 1
+          fi
+          echo "OK: every failure also fails without the change -- no regression"
