@@ -73,9 +73,10 @@ jobs:
           # library path for libtalloc, and passing CPPFLAGS on the
           # command line replaces the makefile's own value instead of
           # extending it, which would drop "-I." and break the build.
-          install -m 644 "$V/talloc.h" /usr/local/include/talloc.h
-          install -m 644 /tmp/talloc/libtalloc.a /usr/local/lib/libtalloc.a
-          ldconfig || true
+          # /usr/local needs root, the runner user is not root.
+          sudo install -m 644 "$V/talloc.h" /usr/local/include/talloc.h
+          sudo install -m 644 /tmp/talloc/libtalloc.a /usr/local/lib/libtalloc.a
+          sudo ldconfig || true
           ls -lh /usr/local/lib/libtalloc.a /usr/local/include/talloc.h
 
       - name: Build proot
