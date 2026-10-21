@@ -191,9 +191,20 @@ jobs:
           fi
 
           # The reference build is the commit without the change under
-          # test: the first parent of the merge base.
+          # test.  A commit that only touches CI is not a change to
+          # proot, so comparing against it would always produce the
+          # same verdict and prove nothing.  The reference is
+          # therefore the parent of the last commit that actually
+          # touched the sources, so the comparison is between the
+          # code and the code before it.
           if [ -z "$BASE_REF" ]; then
-            BASE_REF=$(git rev-parse HEAD^ 2>/dev/null || echo "")
+            last_code=$(git log -1 --format=%H -- src/ tests/ 2>/dev/null || echo "")
+            if [ -n "$last_code" ]; then
+              BASE_REF=$(git rev-parse "$last_code^" 2>/dev/null || echo "")
+            fi
+            if [ -z "$BASE_REF" ]; then
+              BASE_REF=$(git rev-parse HEAD^ 2>/dev/null || echo "")
+            fi
           fi
           echo "reference commit: $BASE_REF"
           if [ -z "$BASE_REF" ]; then
