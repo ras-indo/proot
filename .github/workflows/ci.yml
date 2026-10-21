@@ -99,9 +99,49 @@ jobs:
           # and with pipefail the make pipeline would abort the step
           # right here.
           set +e
+
+          # Bound every single proot invocation.  The upstream suite
+          # contains a test that re-executes itself through
+          # /proc/self/exe and never terminates on a current host; a
+          # hang would otherwise block the whole suite until the job
+          # times out.  A test that hits the limit reports 125, the
+          # status the suite already uses for a test that cannot run
+          # on this host, so a hang is neither reported as a failure
+          # nor silently ignored.
+          #
+          # "timeout" is looked up with an absolute path: some tests
+          # run proot with an empty PATH, where a bare "timeout" would
+          # not be found.
+          cat > /tmp/proot-timeout.sh <<'EOF'
+          #!/bin/sh
+          limit=${PROOT_TIMEOUT:-120}
+          TIMEOUT_BIN=
+          for candidate in /usr/bin/timeout /bin/timeout /usr/local/bin/timeout; do
+              if [ -x "$candidate" ]; then
+                  TIMEOUT_BIN=$candidate
+                  break
+              fi
+          done
+          if [ -z "$TIMEOUT_BIN" ]; then
+              echo "proot-timeout: no timeout command found" >&2
+              exit 125
+          fi
+          "$TIMEOUT_BIN" -k 5 "$limit" "$@"
+          status=$?
+          if [ "$status" -eq 124 ] || [ "$status" -eq 137 ]; then
+              echo "proot-timeout: killed after ${limit}s" >&2
+              exit 125
+          fi
+          exit "$status"
+          EOF
+          chmod +x /tmp/proot-timeout.sh
+
           cd tests
           rm -f failure
-          make check PROOT="$PWD/../src/proot" 2>&1 | tee /tmp/check.log
+          # The suite must run serially: several tests share the same
+          # rootfs and would interfere with each other when run in
+          # parallel.
+          make check PROOT="/tmp/proot-timeout.sh $GITHUB_WORKSPACE/src/proot" 2>&1 | tee /tmp/check.log
           rc=${PIPESTATUS[0]}
           echo "make check exit=$rc"
           echo "$rc" > /tmp/check.rc
@@ -206,7 +246,7 @@ jobs:
               set +e
               ( cd "$GITHUB_WORKSPACE/tests" && \
                 make -k V=1 "check-$target" \
-                  PROOT="$bin" ) > "/tmp/diag-$base-$label.log" 2>&1
+                  PROOT="/tmp/proot-timeout.sh $bin" ) > "/tmp/diag-$base-$label.log" 2>&1
               st=$?
               set -e
               echo "  $label: make_exit=$st"
