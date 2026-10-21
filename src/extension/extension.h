@@ -202,6 +202,16 @@ typedef struct extension {
 	 * canonicalize() for every translated path, so the path translation
 	 * cache stays disabled for such a tracee.  */
 	bool needs_host_path;
+
+	/* Set by extensions that need to be notified of every symbolic
+	 * link dereferenced during the canonicalization of a path (the
+	 * SYMLINK_DEREFERENCED event).  Such an extension reconstructs
+	 * information from the very symlinks that were followed, so a
+	 * translation served from the cache -- which skips
+	 * canonicalize() and thus those notifications -- would give it a
+	 * wrong answer.  The path translation cache must therefore not
+	 * be used at all for such a tracee.  */
+	bool needs_canonicalization;
 } Extension;
 
 typedef LIST_HEAD(extensions, extension) Extensions;
@@ -227,6 +237,28 @@ static inline bool extensions_need_host_path(Tracee *tracee)
 
 	LIST_FOREACH(extension, tracee->extensions, link) {
 		if (extension->needs_host_path)
+			return true;
+	}
+
+	return false;
+}
+
+/**
+ * Return true when any extension attached to @tracee needs to be
+ * notified of the symbolic links dereferenced while a path is
+ * canonicalized, in which case the path translation cache must not
+ * be used, since serving a translation from it skips those
+ * notifications.
+ */
+static inline bool extensions_need_canonicalization(Tracee *tracee)
+{
+	Extension *extension;
+
+	if (tracee->extensions == NULL)
+		return false;
+
+	LIST_FOREACH(extension, tracee->extensions, link) {
+		if (extension->needs_canonicalization)
 			return true;
 	}
 

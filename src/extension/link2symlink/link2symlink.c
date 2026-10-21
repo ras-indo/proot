@@ -21,6 +21,7 @@
 #include "syscall/syscall.h"
 #include "syscall/sysnum.h"
 #include "path/path.h"
+#include "path/pcache.h"
 #include "path/f2fs-bug.h"
 #include "arch.h"
 #include "attribute.h"
@@ -243,7 +244,12 @@ static int l2s_symlink(const char *target, const char *path)
 	if (l2s_entry(path, &dir_fd, &name) < 0)
 		return -1;
 
-	return (dir_fd < 0) ? symlink(target, path) : symlinkat(target, dir_fd, name);
+	int status = (dir_fd < 0) ? symlink(target, path)
+				   : symlinkat(target, dir_fd, name);
+
+	if (status == 0)
+		path_cache_reset();
+	return status;
 }
 
 static int l2s_unlink(const char *path)
@@ -254,7 +260,11 @@ static int l2s_unlink(const char *path)
 	if (l2s_entry(path, &dir_fd, &name) < 0)
 		return -1;
 
-	return (dir_fd < 0) ? unlink(path) : unlinkat(dir_fd, name, 0);
+	int status = (dir_fd < 0) ? unlink(path) : unlinkat(dir_fd, name, 0);
+
+	if (status == 0)
+		path_cache_reset();
+	return status;
 }
 
 static int l2s_rename(const char *old_path, const char *new_path)
@@ -269,13 +279,20 @@ static int l2s_rename(const char *old_path, const char *new_path)
 	if (l2s_entry(new_path, &new_dir_fd, &new_name) < 0)
 		return -1;
 
-	if (old_dir_fd < 0 && new_dir_fd < 0)
-		return rename(old_path, new_path);
+	int status;
 
-	/* An absolute path with AT_FDCWD is the side that isn't in the
-	 * l2s directory -- the file being moved into it, typically.  */
-	return renameat(old_dir_fd < 0 ? AT_FDCWD : old_dir_fd, old_name,
-			new_dir_fd < 0 ? AT_FDCWD : new_dir_fd, new_name);
+	if (old_dir_fd < 0 && new_dir_fd < 0)
+		status = rename(old_path, new_path);
+	else {
+		/* An absolute path with AT_FDCWD is the side that isn't in the
+		 * l2s directory -- the file being moved into it, typically.  */
+		status = renameat(old_dir_fd < 0 ? AT_FDCWD : old_dir_fd, old_name,
+				new_dir_fd < 0 ? AT_FDCWD : new_dir_fd, new_name);
+	}
+
+	if (status == 0)
+		path_cache_reset();
+	return status;
 }
 
 /**
@@ -696,6 +713,7 @@ static int move_and_symlink_path(Tracee *tracee, Reg sysarg, Reg link_target_sys
 		status = symlink(intermediate, original);
 		if (status < 0)
 			return status;
+		path_cache_reset();
 	} else {
 		/*Move the original content to new location, by incrementing count at end of path. */
 		size = my_readlink(intermediate, final);
@@ -729,6 +747,7 @@ static int move_and_symlink_path(Tracee *tracee, Reg sysarg, Reg link_target_sys
 	if (status >= 0) {
 		status = symlink(intermediate, final);
 		if (status < 0) status = -errno;
+		else path_cache_reset();
 	}
 	if (status < 0) {
 		status = -errno;
@@ -1232,6 +1251,19 @@ int link2symlink_callback(Extension *extension, ExtensionEvent event,
 
 	switch (event) {
 	case INITIALIZATION: {
+		/* This extension needs to be notified of every symbolic
+		 * link that gets dereferenced during the canonicalization
+		 * of a path (see the SYMLINK_DEREFERENCED event), to
+		 * remember the faked hard link the path went through.
+		 *
+		 * The path translation cache short-circuits canonicalize()
+		 * and thus skips those notifications, which would make this
+		 * extension report the name a file was given in the l2s
+		 * directory instead of the name the tracee used.  So make
+		 * sure the cache never hides a canonicalization from us.
+		 */
+		extension->needs_canonicalization = true;
+
 		/* List of syscalls handled by this extensions.  */
 		static FilteredSysnum filtered_sysnums[] = {
 			{ PR_link,		FILTER_SYSEXIT },

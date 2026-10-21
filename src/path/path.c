@@ -382,7 +382,8 @@ int translate_path(Tracee *tracee, char result[PATH_MAX], int dir_fd,
 	 * a cached translation may be served only when it lands inside the
 	 * rootfs; anything else falls through and is canonicalized again.
 	 */
-	if (path_cache_get(tracee, guest_path, deref_final, result)) {
+	if (!extensions_need_canonicalization(tracee)
+	    && path_cache_get(tracee, guest_path, deref_final, result)) {
 		if (!extensions_need_host_path(tracee)
 		    || belongs_to_guestfs(tracee, result))
 			goto skip;
