@@ -60,30 +60,29 @@ jobs:
           # cannot run target binaries anyway.
           V="$GITHUB_WORKSPACE/vendor/talloc"
           test -f "$V/talloc.c" || { echo "!! missing vendored talloc"; exit 1; }
-          mkdir -p /tmp/talloc/lib /tmp/talloc/include /tmp/talloc/obj
+          rm -rf /tmp/talloc && mkdir -p /tmp/talloc/obj
           gcc -c -O2 -fPIC \
             -D_GNU_SOURCE=1 -D_XOPEN_SOURCE_EXTENDED=1 -D__STDC_WANT_LIB_EXT1__=1 \
             -DSTATIC_talloc_MODULES=NULL \
             '-DSTATIC_talloc_MODULES_PROTO=extern void __talloc_dummy_module_proto(void)' \
             -I"$V" -I"$V/lib/replace" \
             "$V/talloc.c" -o /tmp/talloc/obj/talloc.o
-          ar rcs /tmp/talloc/lib/libtalloc.a /tmp/talloc/obj/talloc.o
-          cp "$V/talloc.h" /tmp/talloc/include/
-          echo 'prefix=/tmp/talloc' > /tmp/talloc/talloc.pc
-          echo 'libdir=${prefix}/lib' >> /tmp/talloc/talloc.pc
-          echo 'includedir=${prefix}/include' >> /tmp/talloc/talloc.pc
-          echo 'Name: talloc' >> /tmp/talloc/talloc.pc
-          echo 'Description: hierarchical pool based memory system' >> /tmp/talloc/talloc.pc
-          echo 'Version: 2.4.2' >> /tmp/talloc/talloc.pc
-          echo 'Libs: -L${libdir} -ltalloc' >> /tmp/talloc/talloc.pc
-          echo 'Cflags: -I${includedir}' >> /tmp/talloc/talloc.pc
-          PKG_CONFIG_PATH=/tmp/talloc pkg-config --exists talloc
-          ls -lh /tmp/talloc/lib/libtalloc.a
+          ar rcs /tmp/talloc/libtalloc.a /tmp/talloc/obj/talloc.o
+          # Install where the compiler finds it without any extra flags:
+          # proot's makefile has no include path for talloc.h and no
+          # library path for libtalloc, and passing CPPFLAGS on the
+          # command line replaces the makefile's own value instead of
+          # extending it, which would drop "-I." and break the build.
+          install -m 644 "$V/talloc.h" /usr/local/include/talloc.h
+          install -m 644 /tmp/talloc/libtalloc.a /usr/local/lib/libtalloc.a
+          ldconfig || true
+          ls -lh /usr/local/lib/libtalloc.a /usr/local/include/talloc.h
 
       - name: Build proot
         run: |
           set -euo pipefail
-          export PKG_CONFIG_PATH=/tmp/talloc
+          # talloc was installed into /usr/local, so no extra flags are
+          # needed and the makefile's own "-I." survives.
           make -C src -j"$(nproc)" WITHOUT_PYTHON=1
           file src/proot
           strings src/proot | grep -q 'PROOT_NO_PATH_CACHE' \
@@ -167,7 +166,6 @@ jobs:
             echo "!! could not create the reference worktree"
             exit 1
           fi
-          export PKG_CONFIG_PATH=/tmp/talloc
           if make -C /tmp/proot-ref/src -j"$(nproc)" WITHOUT_PYTHON=1 >/tmp/ref-build.log 2>&1; then
             echo "unpatched reference build: OK"
           else
